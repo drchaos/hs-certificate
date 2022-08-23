@@ -222,7 +222,7 @@ validatePure validationTime hooks checks store (fqhn,_) (CertificateChain (top:r
   where isExhaustive = checkExhaustive checks
         a |> b = exhaustive isExhaustive a b
 
-        doLeafChecks = doNameCheck top ++ doV3Check topCert ++ doKeyUsageCheck topCert
+        doLeafChecks = doNameCheck top ++ doV3Check topCert ++ doKeyUsageCheck topCert ++ doSelfSignedCheck topCert
             where topCert = getCertificate top
 
         doCheckChain :: Int -> SignedCertificate -> [SignedCertificate] -> [FailedReason]
@@ -309,6 +309,11 @@ validatePure validationTime hooks checks store (fqhn,_) (CertificateChain (top:r
             exhaustiveList (checkExhaustive checks)
                 [ (checkTimeValidity checks, hookValidateTime hooks validationTime cert)
                 ]
+
+        doSelfSignedCheck cert
+            | isSelfSigned cert = [SelfSigned]
+            | otherwise         = []
+
         isSelfSigned :: Certificate -> Bool
         isSelfSigned cert = certSubjectDN cert == certIssuerDN cert
 
