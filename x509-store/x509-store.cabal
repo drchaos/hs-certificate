@@ -16,17 +16,24 @@ Cabal-Version:       >= 1.10
 Library
   Default-Language:  Haskell2010
   Build-Depends:     base >= 3 && < 5
+                   , base58-bytestring
+                   , bloomfilter
                    , bytestring
                    , mtl
                    , containers
+                   , data-default-class 
                    , directory
                    , filepath
+                   , http-client
+                   , hourglass
+                   , network-uri
                    , pem >= 0.1 && < 0.3
                    , asn1-types >= 0.3 && < 0.4
                    , asn1-encoding >= 0.9 && < 0.10
                    , cryptonite
                    , x509 >= 1.7.2
   Exposed-modules:   Data.X509.CertificateStore
+                     Data.X509.CRLStore
                      Data.X509.File
                      Data.X509.Memory
   ghc-options:       -Wall

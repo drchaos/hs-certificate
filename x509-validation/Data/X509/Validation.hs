@@ -1,3 +1,6 @@
+{-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE ImplicitParams #-}
+{-# LANGUAGE RecordWildCards #-}
 -- |
 -- Module      : Data.X509.Validation
 -- License     : BSD-style
@@ -39,6 +42,7 @@ import Data.ASN1.Types
 import Data.Char (toLower)
 import Data.X509
 import Data.X509.CertificateStore
+import Data.X509.CRLStore
 import Data.X509.Validation.Signature
 import Data.X509.Validation.Fingerprint
 import Data.X509.Validation.Cache
@@ -72,6 +76,8 @@ data FailedReason =
     | EmptyChain               -- ^ empty chain of certificate
     | CacheSaysNo String       -- ^ the cache explicitely denied this certificate
     | InvalidSignature SignatureFailure -- ^ signature failed
+    | Revoked                  -- ^ certificate is revoked
+    | CRLValidationError String -- ^ CRL validation failure
     deriving (Show,Eq)
 
 -- | A set of checks to activate or parametrize to perform on certificates.
@@ -118,6 +124,8 @@ data ValidationChecks = ValidationChecks
     -- | Check the top certificate names matching the fully qualified hostname (FQHN).
     -- it's not recommended to turn this check off, if no other name checks are performed.
     , checkFQHN           :: Bool
+    -- | Check certificate status in revokation lists
+    , checkCRL            :: Bool
     } deriving (Show,Eq)
 
 -- | A set of hooks to manipulate the way the verification works.
@@ -156,6 +164,7 @@ defaultChecks = ValidationChecks
     , checkLeafKeyUsage   = []
     , checkLeafKeyPurpose = []
     , checkFQHN           = True
+    , checkCRL            = False
     }
 
 instance Default ValidationChecks where
@@ -176,10 +185,12 @@ instance Default ValidationHooks where
 -- | Validate using the default hooks and checks and the SHA256 mechanism as hashing mechanism
 validateDefault :: CertificateStore  -- ^ The trusted certificate store for CA
                 -> ValidationCache   -- ^ the validation cache callbacks
+                -> CRLStore          -- ^ the CRL store
                 -> ServiceID         -- ^ identification of the connection
                 -> CertificateChain  -- ^ the certificate chain we want to validate
                 -> IO [FailedReason] -- ^ the return failed reasons (empty list is no failure)
-validateDefault = validate HashSHA256 defaultHooks defaultChecks
+validateDefault cs v crls s c = do
+  validate HashSHA256 defaultHooks defaultChecks cs v crls s c
 
 -- | X509 validation
 --
@@ -191,18 +202,24 @@ validate :: HashALG           -- ^ the hash algorithm we want to use for hashing
          -> ValidationChecks  -- ^ Checks to do
          -> CertificateStore  -- ^ The trusted certificate store for CA
          -> ValidationCache   -- ^ the validation cache callbacks
+         -> CRLStore          -- ^ the CRL store
          -> ServiceID         -- ^ identification of the connection
          -> CertificateChain  -- ^ the certificate chain we want to validate
          -> IO [FailedReason] -- ^ the return failed reasons (empty list is no failure)
-validate _ _ _ _ _ _ (CertificateChain []) = return [EmptyChain]
-validate hashAlg hooks checks store cache ident cc@(CertificateChain (top:_)) = do
+validate _ _ _ _ _ _ _ (CertificateChain []) = return [EmptyChain]
+validate hashAlg hooks checks store cache crls ident cc@(CertificateChain certs@(top:_)) = do
     cacheResult <- (cacheQuery cache) ident fingerPrint (getCertificate top)
     case cacheResult of
         ValidationCachePass     -> return []
         ValidationCacheDenied s -> return [CacheSaysNo s]
         ValidationCacheUnknown  -> do
             validationTime <- maybe (timeConvert <$> timeCurrent) return $ checkAtTime checks
-            let failedReasons = validatePure validationTime hooks checks store ident cc
+            when (checkCRL checks) $ do
+              let getCDPs  = extensionGet @ExtCrlDistributionPoints . certExtensions . getCertificate
+                  chainDPs = mapMaybe getCDPs certs >>= extCrlDistributionPoints
+              mapM_ (fetchCRL crls) chainDPs
+            crlsp <- getStore crls
+            let failedReasons = validatePure validationTime hooks checks store crlsp ident cc
             when (null failedReasons) $ (cacheAdd cache) ident fingerPrint (getCertificate top)
             return failedReasons
   where fingerPrint = getFingerprint top hashAlg
@@ -213,19 +230,18 @@ validatePure :: DateTime         -- ^ The time for which to check validity for
              -> ValidationHooks  -- ^ Hooks to use
              -> ValidationChecks -- ^ Checks to do
              -> CertificateStore -- ^ The trusted certificate store for CA
+             -> CRLStorePure     -- ^ the CRL store
              -> ServiceID        -- ^ Identification of the connection
              -> CertificateChain -- ^ The certificate chain we want to validate
              -> [FailedReason]   -- ^ the return failed reasons (empty list is no failure)
-validatePure _              _     _      _     _        (CertificateChain [])           = [EmptyChain]
-validatePure validationTime hooks checks store (fqhn,_) (CertificateChain (top:rchain)) =
-   hookFilterReason hooks (doLeafChecks |> doCheckChain 0 top rchain)
-  where isExhaustive = checkExhaustive checks
-        a |> b = exhaustive isExhaustive a b
-
-        doLeafChecks = doNameCheck top ++ doV3Check topCert ++ doKeyUsageCheck topCert ++ doSelfSignedCheck topCert
+validatePure _              _     _      _     _    _        (CertificateChain [])           = [EmptyChain]
+validatePure validationTime hooks checks store crlsp  (fqhn,_) (CertificateChain (top:rchain)) =
+  let ?checks = checks
+  in hookFilterReason hooks (doLeafChecks |> doCheckChain 0 top rchain)
+  where doLeafChecks = doNameCheck top ++ doV3Check topCert ++ doKeyUsageCheck topCert ++ doSelfSignedCheck topCert
             where topCert = getCertificate top
 
-        doCheckChain :: Int -> SignedCertificate -> [SignedCertificate] -> [FailedReason]
+        doCheckChain :: (?checks :: ValidationChecks) => Int -> SignedCertificate -> [SignedCertificate] -> [FailedReason]
         doCheckChain level current chain =
             doCheckCertificate (getCertificate current)
             -- check if we have a trusted certificate in the store belonging to this issuer.
@@ -239,8 +255,10 @@ validatePure validationTime hooks checks store (fqhn,_) (CertificateChain (top:r
                                 Just (issuer, remaining) ->
                                     checkCA level (getCertificate issuer)
                                     |> checkSignature current issuer
+                                    |> doCheckDPs crlsp issuer cert cdps
                                     |> doCheckChain (level+1) issuer remaining)
           where cert = getCertificate current
+                cdps = (extCrlDistributionPoints =<< maybeToList (extensionGet . certExtensions $ cert))
         -- in a strict ordering check the next certificate has to be the issuer.
         -- otherwise we dynamically reorder the chain to have the necessary certificate
         findIssuer issuerDN chain
@@ -398,6 +416,10 @@ validateCertificateName fqhn cert
 matchSI :: DistinguishedName -> Certificate -> Bool
 matchSI issuerDN issuer = certSubjectDN issuer == issuerDN
 
+(|>) :: (?checks :: ValidationChecks) => [FailedReason] -> [FailedReason] -> [FailedReason]
+a |> b = exhaustive isExhaustive a b
+  where isExhaustive = checkExhaustive ?checks
+
 exhaustive :: Bool -> [FailedReason] -> [FailedReason] -> [FailedReason]
 exhaustive isExhaustive l1 l2
   | null l1      = l2
@@ -409,3 +431,128 @@ exhaustiveList _            []                    = []
 exhaustiveList isExhaustive ((performCheck,c):cs)
     | performCheck = exhaustive isExhaustive c (exhaustiveList isExhaustive cs)
     | otherwise    = exhaustiveList isExhaustive cs
+
+-- | This function implements CRL processing algorithm described in RFC5280 6.3.3.
+-- Delta CRL's support is not implemented.
+doCheckDPs :: (?checks::ValidationChecks)
+           => CRLStorePure
+           -> SignedExact Certificate
+           -> Certificate
+           -> [DistributionPoint]
+           -> [FailedReason]
+doCheckDPs crlStore trustAnchor cert cdps
+  | checkCRL ?checks = go (Just []) Nothing cdps
+  | otherwise        = []
+  where
+    go _           certStatus []       = statusDefined certStatus
+    go reasonsMask certStatus (dp:dps) 
+      | Just _  <- reasonsMask
+      , Nothing <- certStatus = do
+          case (lookupStore dp crlStore) of
+            Nothing -> error "No CRL in store"
+            Just sCrl ->
+              let crl = getCRL $ signedCRL sCrl
+                  idp = fmap (either error extIDP) $ extensionGetE @ExtIssuingDistributionPoint $ crlExtensions crl 
+              in doIssuerAndScopeCheck crl dp idp
+                 |> (withReasons reasonsMask certStatus dp idp $ \ reasonsMask' ->
+              
+-- j
+                   let certStatus' = if sCrl `hasSerial` cert  -- quick check that certificate seril number is in the CRL list
+                                        then calculateStatus crl idp
+                                        else Nothing
+                                     
+                      in verifyCRL (signedCRL sCrl) |> go reasonsMask' certStatus' dps)
+        | otherwise = statusDefined certStatus
+
+    statusDefined = maybe [] (const [Revoked])
+
+    withReasons reasonsMask certStatus dp idp act 
+      | verifyReasons = act $ liftA2 union interimReasonsMask reasonsMask
+      | otherwise     = statusDefined certStatus
+      where
+-- d
+        interimReasonsMask =
+            case (idpOnlySomeReasons =<< idp, distributionPointReasons dp) of
+              (Just idpReasons, Just dpReasons) -> Just $ intersect idpReasons dpReasons
+              (Just idpReasons, Nothing)        -> Just idpReasons
+              (Nothing, Just dpReasons)         -> Just dpReasons
+              (Nothing, Nothing)                -> Nothing
+-- e
+        verifyReasons =
+            case liftA2 (\\) interimReasonsMask reasonsMask of
+              Just [] -> False -- no new reasons stop checking CRL
+              Nothing -> True  -- all-reasons
+              Just _  -> True  -- new reasosns
+
+    calculateStatus crl idp =
+      case find (\ rc -> certSerial cert == revokedSerialNumber rc) $ crlRevokedCertificates crl of
+        Just rc
+          | indirectCRL && matchRC rc || True -> case getReasonCode rc of
+                                                   CRLReason_RemoveFromCRL -> Nothing
+                                                   r                       -> Just r
+        _ -> Nothing
+      where indirectCRL = maybe False idpIndirectCRL idp
+            defIssuer
+              | firstRC <- listToMaybe $ crlRevokedCertificates crl
+              , Just firstEntryIssuer <- (getCertIssuer =<< firstRC) = Right firstEntryIssuer
+              | otherwise                                            = Left $ crlIssuer crl
+            getCertIssuer = fmap (either error extCertificateIssuer) . extensionGetE . revokedExtensions
+            getReasonCode = fromMaybe CRLReason_Unspecified . fmap (either error extReasonCode) . extensionGetE . revokedExtensions
+            matchRC rc = case (fromMaybe defIssuer $ fmap Right $ getCertIssuer rc) of
+                           Right gns -> matches gns (certIssuerDN cert)
+                           Left  dn  -> dn == certIssuerDN cert
+            matches = error "Revoked certificate issuer name and certIssuer name match is not implemented"
+
+
+    doIssuerAndScopeCheck crl dp idp =
+-- b.1
+                  doDPIssuerCheck crl dp idp
+-- b.2
+                  |> doIDPIssuerCheck crl dp idp
+                  |> doIDPScopeCheck idp
+
+    doDPIssuerCheck crl dp idp =
+      case (distributionPointIssuer dp) of
+        Nothing 
+          | (crlIssuer crl == certIssuerDN cert) -> []
+        Just dpIssuer 
+          | matches dpIssuer (certIssuerDN cert) && indirectCRL -> []
+        _ -> [CRLValidationError "DP CRL issuer mismatch"]
+      where
+        indirectCRL = maybe False idpIndirectCRL idp
+        matches = error "DP name and certIssuer name match is not implemented"
+
+    doIDPIssuerCheck _   _ Nothing = []
+    doIDPIssuerCheck crl dp (Just idp) =
+      case (idpDistributionPoint idp,distributionPointName dp) of
+        (Just idpName, Just dpName)
+          | False <- matchesDPN idpName dpName -> [CRLValidationError "DP and IDP name mismatch"]
+        (Just idpName, Nothing)
+          | False <- matches idpName (crlIssuer crl) -> [CRLValidationError "DP and IDP name mismatch"]
+        _ -> []
+      where
+        matches = error "IDP name and CRLIssuer name match is not implemented"
+
+    matchesDPN (DistributionPointFullName lnames) (DistributionPointFullName rnames) = any (`elem` rnames) lnames
+    matchesDPN _ _= error "Diestribution point relative names not implemented"
+
+    doIDPScopeCheck Nothing = []
+    doIDPScopeCheck (Just idp) 
+      | idpOnlyUserCerts idp
+      , True <- ca = [CRLValidationError "IDP and cert scope mismatch: CA"]
+      | idpOnlyCACerts idp
+      , False <- ca = [CRLValidationError "IDP and cert scope mismatch: no CA"]
+      | idpOnlyAttributeCerts idp = [CRLValidationError "IDP scope mismatch"]
+      | otherwise = []
+      where ca = fromMaybe False $ fmap extBasicConstraintsCA $ extensionGet $ certExtensions cert
+
+-- f
+-- g
+    verifyCRL crl = case verifySignedSignature crl pubKey of
+                      SignatureFailed r -> [InvalidSignature r]
+                      SignaturePass
+                        | Just False <- fmap (KeyUsage_cRLSign `elem`) keyUsage -> [CRLValidationError "CA scope mismatch"]
+                        | otherwise                                             -> []
+      where keyUsage = fmap (either error extKeyUsage) $ extensionGetE $ certExtensions $ getCertificate trustAnchor
+            pubKey   = certPubKey $ getCertificate trustAnchor
+

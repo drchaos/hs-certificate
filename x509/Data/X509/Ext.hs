@@ -9,6 +9,10 @@
 --
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE TypeApplications #-}
 module Data.X509.Ext
     ( Extension(..)
     -- * Common extension usually found in x509v3
@@ -22,9 +26,18 @@ module Data.X509.Ext
     , ExtAuthorityKeyId(..)
     , ExtCrlDistributionPoints(..)
     , ExtNetscapeComment(..)
+    , ExtFreshestCrl(..)
+    , ExtIssuingDistributionPoint(..)
+    , ExtReasonCode(..)
+    , ExtCertificateIssuer(..)
     , AltName(..)
+    , GeneralName
+    , GeneralNames
     , DistributionPoint(..)
+    , IssuingDistributionPoint(..)
+    , DistributionPointName(..)
     , ReasonFlag(..)
+    , CRLReason(..)
     -- * Accessor turning extension into a specific one
     , extensionGet
     , extensionGetE
@@ -36,15 +49,21 @@ import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as BC
 import Data.ASN1.Types
 import Data.ASN1.Parse
+import Data.ASN1.Prim
+import Data.ASN1.Pretty
 import Data.ASN1.Encoding
 import Data.ASN1.BinaryEncoding
 import Data.ASN1.BitArray
+import Data.Bool  (bool)
+import Data.Maybe (fromMaybe)
+import Data.List  (find)
 import Data.Proxy
-import Data.List (find)
 import Data.X509.ExtensionRaw
 import Data.X509.DistinguishedName
+import Data.X509.Internal
 import Control.Applicative
 import Control.Monad
+
 
 -- | key usage flag that is found in the key usage extension field.
 data ExtKeyUsageFlag =
@@ -124,12 +143,17 @@ extensionEncode critical ext
     | extHasNestedASN1 (Proxy :: Proxy a) = ExtensionRaw (extOID ext) critical (encodeASN1' DER $ extEncode ext)
     | otherwise                           = ExtensionRaw (extOID ext) critical (extEncodeBs ext)
 
+idCe :: Integer -> OID
+idCe n = [2,5,29,n]
+
 -- | Basic Constraints
-data ExtBasicConstraints = ExtBasicConstraints Bool (Maybe Integer)
+data ExtBasicConstraints = ExtBasicConstraints { extBasicConstraintsCA         :: Bool
+                                               , extBasicConstraintsPathLength :: (Maybe Integer)
+                                               }
     deriving (Show,Eq)
 
 instance Extension ExtBasicConstraints where
-    extOID = const [2,5,29,19]
+    extOID = const $ idCe 19
     extHasNestedASN1 = const True
     extEncode (ExtBasicConstraints b Nothing)  = [Start Sequence,Boolean b,End Sequence]
     extEncode (ExtBasicConstraints b (Just i)) = [Start Sequence,Boolean b,IntVal i,End Sequence]
@@ -142,11 +166,11 @@ instance Extension ExtBasicConstraints where
     extDecode _ = Left "unknown sequence"
 
 -- | Describe key usage
-data ExtKeyUsage = ExtKeyUsage [ExtKeyUsageFlag]
+data ExtKeyUsage = ExtKeyUsage { extKeyUsage :: [ExtKeyUsageFlag] }
     deriving (Show,Eq)
 
 instance Extension ExtKeyUsage where
-    extOID = const [2,5,29,15]
+    extOID = const $ idCe 15
     extHasNestedASN1 = const True
     extEncode (ExtKeyUsage flags) = [BitString $ flagsToBits flags]
     extDecode [BitString bits] = Right $ ExtKeyUsage $ bitsToFlags bits
@@ -178,7 +202,7 @@ data ExtExtendedKeyUsage = ExtExtendedKeyUsage [ExtKeyUsagePurpose]
     deriving (Show,Eq)
 
 instance Extension ExtExtendedKeyUsage where
-    extOID = const [2,5,29,37]
+    extOID = const $ idCe 37
     extHasNestedASN1 = const True
     extEncode (ExtExtendedKeyUsage purposes) =
         [Start Sequence] ++ map (OID . lookupRev) purposes ++ [End Sequence]
@@ -195,7 +219,7 @@ data ExtSubjectKeyId = ExtSubjectKeyId B.ByteString
     deriving (Show,Eq)
 
 instance Extension ExtSubjectKeyId where
-    extOID = const [2,5,29,14]
+    extOID = const $ idCe 14
     extHasNestedASN1 = const True
     extEncode (ExtSubjectKeyId o) = [OctetString o]
     extDecode [OctetString o] = Right $ ExtSubjectKeyId o
@@ -219,16 +243,19 @@ data AltName =
     | AltNameDNSSRV String
     deriving (Show,Eq,Ord)
 
+type GeneralName = AltName
+type GeneralNames = [AltName]
+
 -- | Provide a way to supply alternate name that can be
 -- used for matching host name.
 data ExtSubjectAltName = ExtSubjectAltName [AltName]
     deriving (Show,Eq,Ord)
 
 instance Extension ExtSubjectAltName where
-    extOID = const [2,5,29,17]
+    extOID = const $ idCe 17
     extHasNestedASN1 = const True
-    extEncode (ExtSubjectAltName names) = encodeGeneralNames names
-    extDecode l = runParseASN1 (ExtSubjectAltName <$> parseGeneralNames) l
+    extEncode (ExtSubjectAltName names) = toASN1 names []
+    extDecode = runParseASN1 (ExtSubjectAltName <$> getObject)
 
 -- | Provide a mean to identify the public key corresponding to the private key
 -- used to signed a certificate.
@@ -236,7 +263,7 @@ data ExtAuthorityKeyId = ExtAuthorityKeyId B.ByteString
     deriving (Show,Eq)
 
 instance Extension ExtAuthorityKeyId where
-    extOID _ = [2,5,29,35]
+    extOID = const $ idCe 35
     extHasNestedASN1 = const True
     extEncode (ExtAuthorityKeyId keyid) =
         [Start Sequence,Other Context 0 keyid,End Sequence]
@@ -245,8 +272,14 @@ instance Extension ExtAuthorityKeyId where
     extDecode _ = Left "unknown sequence"
 
 -- | Identify how CRL information is obtained
-data ExtCrlDistributionPoints = ExtCrlDistributionPoints [DistributionPoint]
+data ExtCrlDistributionPoints = ExtCrlDistributionPoints { extCrlDistributionPoints :: [DistributionPoint] }
     deriving (Show,Eq)
+
+instance Extension ExtCrlDistributionPoints where
+    extOID = const $ idCe 31
+    extHasNestedASN1 = const True
+    extEncode (ExtCrlDistributionPoints points) = (foldl (.) id $ fmap toASN1 points) []
+    extDecode = runParseASN1 $ ExtCrlDistributionPoints <$> onNextContainer Sequence (getMany getObject)
 
 -- | Reason flag for the CRL
 data ReasonFlag =
@@ -261,27 +294,155 @@ data ReasonFlag =
     | Reason_AACompromise
     deriving (Show,Eq,Ord,Enum)
 
+type ReasonFlags = [ReasonFlag]
+
 -- | Distribution point as either some GeneralNames or a DN
-data DistributionPoint =
-      DistributionPointFullName [AltName]
+data DistributionPoint = DistributionPoint
+    { distributionPointName    :: Maybe DistributionPointName
+    , distributionPointReasons :: Maybe ReasonFlags
+    , distributionPointIssuer  :: Maybe GeneralNames
+    } deriving (Show,Eq, Ord)
+
+instance ASN1Object DistributionPoint where
+  toASN1 DistributionPoint{..} = maybe id (asn1ContainerS (Container Context 0) . toASN1) distributionPointName
+                               . maybe id ((:) . Other Context 1 . putBitString . flagsToBits) distributionPointReasons
+                               . maybe id (asn1ContainerS (Container Context 2) . toASN1) distributionPointIssuer
+  fromASN1 = runParseASN1State $ onNextContainer Sequence $
+     DistributionPoint <$> (onNextContainerMaybe (Container Context 0) getObject)
+                       <*> (parseOptionalPrimitive Context 1 $ (rightToMaybe . getBitString) >=> fmap bitsToFlags . fromBitString)
+                       <*> (onNextContainerMaybe (Container Context 2) getObject)
+
+instance ASN1Object ReasonFlags where
+  toASN1 flags = (:) (BitString $ flagsToBits flags)
+  fromASN1 (BitString bits:xs) = Right $ (bitsToFlags bits,xs)
+  fromASN1 _ = Left "ReasonFlags: unknown sequence"
+
+data DistributionPointName =
+      DistributionPointFullName GeneralNames
     | DistributionNameRelative DistinguishedName
+    deriving (Show,Eq,Ord)
+
+instance ASN1Object DistributionPointName where
+  toASN1 (DistributionPointFullName names) = asn1ContainerS (Container Context 0) $ toASN1 names
+  toASN1 (DistributionNameRelative name) = asn1ContainerS (Container Context 1) $ toASN1 name
+  fromASN1 asn = runParseASN1State ( do
+    (DistributionPointFullName <$> onNextContainer (Container Context 0) ((getMany $ getObject @AltName) <|> getObject))
+    <|>
+    (DistributionNameRelative <$> onNextContainer (Container Context 1) getObject)
+    <|>
+    throwParseError ("DistributionPointName: Unknown container or tag \n" <> pretty SingleLine asn)) asn
+
+data ExtFreshestCrl = ExtFreshestCrl [DistributionPoint]
     deriving (Show,Eq)
 
-instance Extension ExtCrlDistributionPoints where
-    extOID _ = [2,5,29,31]
+instance Extension ExtFreshestCrl where
+    extOID = const $ idCe 46
     extHasNestedASN1 = const True
-    extEncode = error "extEncode ExtCrlDistributionPoints unimplemented"
-    extDecode = error "extDecode ExtCrlDistributionPoints unimplemented"
-    --extEncode (ExtCrlDistributionPoints )
+    extEncode (ExtFreshestCrl points) = (foldl (.) id $ fmap toASN1 points) []
+    extDecode = runParseASN1 $ ExtFreshestCrl <$> onNextContainer Sequence (getMany getObject)
 
-parseGeneralNames :: ParseASN1 [AltName]
-parseGeneralNames = onNextContainer Sequence $ getMany getAddr
+-- CRL entry
+data ExtReasonCode = ExtReasonCode { extReasonCode :: CRLReason }
+    deriving (Show,Eq)
+
+instance Extension ExtReasonCode where
+    extOID  = const $ idCe 21
+    extHasNestedASN1 = const True
+    extEncode (ExtReasonCode r) = [Enumerated $ fromIntegral $ fromEnum r]
+    extDecode [Enumerated i] = Right $ ExtReasonCode $ toEnum $ fromIntegral i
+    extDecode _              = Left "CRLReason: unknown sequence"
+
+data CRLReason =
+      CRLReason_Unspecified
+    | CRLReason_KeyCompromise
+    | CRLReason_CACompromise
+    | CRLReason_AffiliationChanged
+    | CRLReason_Superseded
+    | CRLReason_CessationOfOperation
+    | CRLReason_CertificateHold
+    | CRLReason_Unused
+    | CRLReason_RemoveFromCRL
+    | CRLReason_PrivilegeWithdrawn
+    | CRLReason_AACompromise
+    deriving (Show,Eq,Ord,Enum)
+
+data ExtCertificateIssuer = ExtCertificateIssuer { extCertificateIssuer :: GeneralNames }
+    deriving (Show,Eq)
+
+instance Extension ExtCertificateIssuer where
+    extOID  = const $ idCe 29
+    extHasNestedASN1 = const True
+    extEncode (ExtCertificateIssuer names) = toASN1 names []
+    extDecode = runParseASN1 (ExtCertificateIssuer <$> getObject)
+
+-- CRL entry }
+
+data ExtIssuingDistributionPoint = ExtIssuingDistributionPoint { extIDP :: IssuingDistributionPoint }
+    deriving (Show,Eq)
+
+instance Extension ExtIssuingDistributionPoint where
+    extOID = const $ idCe 28
+    extHasNestedASN1 = const True
+    extEncode (ExtIssuingDistributionPoint point) = asn1ContainerS Sequence (toASN1 point) $ []
+    extDecode = runParseASN1 $ ExtIssuingDistributionPoint <$> onNextContainer Sequence getObject
+
+data IssuingDistributionPoint = IssuingDistributionPoint
+    { idpDistributionPoint :: Maybe DistributionPointName
+    , idpOnlyUserCerts :: Bool
+    , idpOnlyCACerts :: Bool
+    , idpOnlySomeReasons :: Maybe ReasonFlags
+    , idpIndirectCRL :: Bool
+    , idpOnlyAttributeCerts :: Bool
+    } deriving (Show,Eq)
+
+instance ASN1Object IssuingDistributionPoint where
+    toASN1 IssuingDistributionPoint{..} =
+        maybe id (asn1ContainerS (Container Context 0) . toASN1) idpDistributionPoint
+      . bool id ((:) $ Other Context 1 $ putBool True) idpOnlyUserCerts
+      . bool id ((:) $ Other Context 2 $ putBool True) idpOnlyCACerts
+      . maybe id ((:) . Other Context 3 . putBitString . flagsToBits) idpOnlySomeReasons
+      . bool id ((:) $ Other Context 4 $ putBool True) idpIndirectCRL
+      . bool id ((:) $ Other Context 5 $ putBool True) idpOnlyAttributeCerts
+    fromASN1 = runParseASN1State $
+       IssuingDistributionPoint <$> (onNextContainerMaybe (Container Context 0) getObject)
+                         <*>  fmap (fromMaybe False) (parseOptionalPrimitive Context 1 $ (rightToMaybe . getBoolean False) >=> fromBoolean)
+                         <*>  fmap (fromMaybe False) (parseOptionalPrimitive Context 2 $ (rightToMaybe . getBoolean False) >=> fromBoolean)
+                         <*>  (parseOptionalPrimitive Context 3 $ (rightToMaybe . getBitString) >=> fmap bitsToFlags . fromBitString)
+                         <*>  fmap (fromMaybe False) (parseOptionalPrimitive Context 4 $ (rightToMaybe . getBoolean False) >=> fromBoolean)
+                         <*>  fmap (fromMaybe False) (parseOptionalPrimitive Context 5 $ (rightToMaybe . getBoolean False) >=> fromBoolean)
+
+rightToMaybe :: Either b a -> Maybe a
+rightToMaybe = either (const Nothing) Just
+
+fromBoolean :: ASN1 -> Maybe Bool
+fromBoolean (Boolean b) = Just b
+fromBoolean _           = Nothing
+
+fromBitString :: ASN1 -> Maybe BitArray
+fromBitString (BitString ba) = Just ba
+fromBitString _              = Nothing
+
+parseOptionalPrimitive :: ASN1Class -> ASN1Tag -> (BC.ByteString -> Maybe a) -> ParseASN1 (Maybe a)
+parseOptionalPrimitive cls tag decode = do
+  getNextMaybe $ \case
+    Other cls' tag' bs | cls == cls', tag' == tag -> decode bs
+    _                  -> Nothing
+
+instance ASN1Object GeneralNames where
+  toASN1 names = asn1ContainerS Sequence $ foldl (.) id $ fmap toASN1 names
+  fromASN1 = runParseASN1State $ onNextContainer Sequence $ getMany getObject
+
+instance ASN1Object AltName where
+  toASN1 name = (encodeAltName name <>)
+  fromASN1 = runParseASN1State parseGeneralName
+
+parseGeneralName :: ParseASN1 AltName
+parseGeneralName = do
+    m <- onNextContainerMaybe (Container Context 0) getComposedAddr
+    case m of
+        Nothing -> getSimpleAddr
+        Just r  -> return r
   where
-        getAddr = do
-            m <- onNextContainerMaybe (Container Context 0) getComposedAddr
-            case m of
-                Nothing -> getSimpleAddr
-                Just r  -> return r
         getComposedAddr = do
             n <- getNext
             case n of
@@ -313,21 +474,17 @@ parseGeneralNames = onNextContainer Sequence $ getMany getAddr
                 (Other Context 7 b) -> return $ AltNameIP  b
                 _                   -> throwParseError ("GeneralNames: not coping with unknown stream " ++ show n)
 
-encodeGeneralNames :: [AltName] -> [ASN1]
-encodeGeneralNames names =
-    [Start Sequence]
-    ++ concatMap encodeAltName names
-    ++ [End Sequence]
-  where encodeAltName (AltNameRFC822 n) = [Other Context 1 $ BC.pack n]
-        encodeAltName (AltNameDNS n)    = [Other Context 2 $ BC.pack n]
-        encodeAltName (AltNameURI n)    = [Other Context 6 $ BC.pack n]
-        encodeAltName (AltNameIP n)     = [Other Context 7 $ n]
-        encodeAltName (AltNameXMPP n)   = [Start (Container Context 0),OID[1,3,6,1,5,5,7,8,5]
-                                          ,Start (Container Context 0), ASN1String $ asn1CharacterString UTF8 n, End (Container Context 0)
-                                          ,End (Container Context 0)]
-        encodeAltName (AltNameDNSSRV n) = [Start (Container Context 0),OID[1,3,6,1,5,5,7,8,5]
-                                          ,Start (Container Context 0), ASN1String $ asn1CharacterString UTF8 n, End (Container Context 0)
-                                          ,End (Container Context 0)]
+encodeAltName :: AltName -> [ASN1]
+encodeAltName (AltNameRFC822 n) = [Other Context 1 $ BC.pack n]
+encodeAltName (AltNameDNS n)    = [Other Context 2 $ BC.pack n]
+encodeAltName (AltNameURI n)    = [Other Context 6 $ BC.pack n]
+encodeAltName (AltNameIP n)     = [Other Context 7 $ n]
+encodeAltName (AltNameXMPP n)   = [Start (Container Context 0),OID[1,3,6,1,5,5,7,8,5]
+                                  ,Start (Container Context 0), ASN1String $ asn1CharacterString UTF8 n, End (Container Context 0)
+                                  ,End (Container Context 0)]
+encodeAltName (AltNameDNSSRV n) = [Start (Container Context 0),OID[1,3,6,1,5,5,7,8,5]
+                                  ,Start (Container Context 0), ASN1String $ asn1CharacterString UTF8 n, End (Container Context 0)
+                                  ,End (Container Context 0)]
 
 bitsToFlags :: Enum a => BitArray -> [a]
 bitsToFlags bits = concat $ flip map [0..(bitArrayLength bits-1)] $ \i -> do

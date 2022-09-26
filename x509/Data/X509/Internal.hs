@@ -8,6 +8,7 @@
 module Data.X509.Internal
     ( module Data.ASN1.Parse
     , asn1Container
+    , asn1ContainerS
     , OID
     -- * error handling
     , ErrT
@@ -24,4 +25,8 @@ type ErrT = ExceptT
 
 -- | create a container around the stream of ASN1
 asn1Container :: ASN1ConstructionType -> [ASN1] -> [ASN1]
-asn1Container ty l = [Start ty] ++ l ++ [End ty]
+asn1Container ty l = asn1ContainerS ty (l ++) []
+
+-- | create a container around the stream of ASN1
+asn1ContainerS :: ASN1ConstructionType -> ASN1S -> ASN1S
+asn1ContainerS ty l = (Start ty :) . l . (End ty :)
