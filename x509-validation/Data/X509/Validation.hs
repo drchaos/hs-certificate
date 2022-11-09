@@ -241,24 +241,24 @@ validatePure validationTime hooks checks store crlsp  (fqhn,_) (CertificateChain
   where doLeafChecks = doNameCheck top ++ doV3Check topCert ++ doKeyUsageCheck topCert ++ doSelfSignedCheck topCert
             where topCert = getCertificate top
 
+        checkCertificate sCert issuer = checkSignature sCert issuer |> checkDPs crlsp sCert issuer
+
         doCheckChain :: (?checks :: ValidationChecks) => Int -> SignedCertificate -> [SignedCertificate] -> [FailedReason]
         doCheckChain level current chain =
             doCheckCertificate (getCertificate current)
             -- check if we have a trusted certificate in the store belonging to this issuer.
             |> (case findCertificate (certIssuerDN cert) store of
-                Just trustedSignedCert      -> checkSignature current trustedSignedCert
-                Nothing | isSelfSigned cert -> [SelfSigned] |> checkSignature current current
+                Just trustedSignedCert      -> checkCertificate current trustedSignedCert
+                Nothing | isSelfSigned cert -> [SelfSigned] |> checkCertificate current current
                         | null chain        -> [UnknownCA]
                         | otherwise         ->
                             case findIssuer (certIssuerDN cert) chain of
                                 Nothing                  -> [UnknownCA]
                                 Just (issuer, remaining) ->
                                     checkCA level (getCertificate issuer)
-                                    |> checkSignature current issuer
-                                    |> doCheckDPs crlsp issuer cert cdps
+                                    |> checkCertificate current issuer
                                     |> doCheckChain (level+1) issuer remaining)
           where cert = getCertificate current
-                cdps = (extCrlDistributionPoints =<< maybeToList (extensionGet . certExtensions $ cert))
         -- in a strict ordering check the next certificate has to be the issuer.
         -- otherwise we dynamically reorder the chain to have the necessary certificate
         findIssuer issuerDN chain
@@ -434,16 +434,17 @@ exhaustiveList isExhaustive ((performCheck,c):cs)
 
 -- | This function implements CRL processing algorithm described in RFC5280 6.3.3.
 -- Delta CRL's support is not implemented.
-doCheckDPs :: (?checks::ValidationChecks)
+checkDPs :: (?checks::ValidationChecks)
            => CRLStorePure
+           -> SignedCertificate
            -> SignedExact Certificate
-           -> Certificate
-           -> [DistributionPoint]
            -> [FailedReason]
-doCheckDPs crlStore trustAnchor cert cdps
+checkDPs crlStore sCert trustAnchor
   | checkCRL ?checks = go (Just []) Nothing cdps
   | otherwise        = []
   where
+    cert = getCertificate sCert
+    cdps = (extCrlDistributionPoints =<< maybeToList (extensionGet . certExtensions $ cert))
     go _           certStatus []       = statusDefined certStatus
     go reasonsMask certStatus (dp:dps) 
       | Just _  <- reasonsMask
