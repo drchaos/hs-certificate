@@ -1,5 +1,6 @@
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE TupleSections #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 module Data.X509.CRLStore
     ( CRLStore(..)
     , CRLStorePure
@@ -7,6 +8,7 @@ module Data.X509.CRLStore
     , signedCRL
     , newMemoryStore
     , newFileStore
+    , newFileStoreWithManager
     , loadStore
     -- * Queries
     , lookupStore
@@ -21,9 +23,10 @@ import Data.Default.Class
 import Data.Foldable          (asum)
 import Data.IORef             (IORef, newIORef, readIORef, atomicModifyIORef')
 import Data.Map.Strict        (Map)
-import Data.Maybe             (mapMaybe)
+import Data.Maybe             (mapMaybe, catMaybes)
 import Data.X509
 import Control.Applicative    ((<$>))
+import Control.Exception      (Exception, throwIO, throw, IOException, catch)
 import Control.Monad          (forM, forM_)
 import Network.URI            (normalizeCase)
 import Network.HTTP.Client    (Manager, parseRequest, Response (..),
@@ -39,6 +42,12 @@ import qualified Data.Map.Strict       as Map
 
 type CRLStorePure = Map String StoredCRL
 type CRLStorePureRef = IORef CRLStorePure
+
+data CRLStoreError = CRLDecodeError { crlURI :: String, crlError :: String }
+                   | CRLExtError String
+  deriving Show
+
+instance Exception CRLStoreError
 
 data CRLStore = CRLStore { getStore :: IO CRLStorePure
                          , fetchCRL :: DistributionPoint -> IO ()
@@ -95,12 +104,14 @@ fileToURI = fmap B8.unpack . decodeBase58 bitcoinAlphabet . B8.pack
 
 loadStore :: FilePath -> IO CRLStorePure
 loadStore cacheDir = do
-  files <- listDirectory cacheDir
-  let dd = mapMaybe (\ f -> (,cacheDir </> f) <$> fileToURI f) files
-  readCRLs <- forM dd $ \ (uri,path) -> do
-    sCrl <- either error id . decodeSignedCRL <$> B.readFile path
-    return (uri,mkStoredCRL sCrl)
-  return $ Map.fromList readCRLs
+  files <- listDirectory cacheDir `catch` emptyDir
+  let storedCRLs = mapMaybe (\ f -> (,cacheDir </> f) <$> fileToURI f) files
+  readCRLs <- forM storedCRLs $ \ (uri,path) -> do
+    (either (const Nothing) (Just . (uri,).mkStoredCRL) . decodeSignedCRL <$> B.readFile path) `catch` skipIOError
+  return $ Map.fromList $ catMaybes readCRLs
+  where skipIOError (_ :: IOException) = return Nothing
+        emptyDir    (_ :: IOException) = return []
+  
 
 saveTo :: FilePath -> String -> B8.ByteString -> IO ()
 saveTo crlsPath uri bs = do
@@ -123,22 +134,22 @@ fetchAndSave saveCRL manager mapRef dp = do
               forM_ uris $ \ uri -> do
                 request <- parseRequest uri
                 f <- toStrict . responseBody <$> httpLbs request manager
+                sCrl <- either (throwIO . CRLDecodeError uri) return $ decodeSignedCRL f
                 saveCRL uri f
-                sCrl <- either error return $ decodeSignedCRL f
                 atomicModifyIORef' mapRef $ \ m' -> ( Map.insert uri (mkStoredCRL sCrl) m' , ())
 
 lookupStore :: DistributionPoint -> CRLStorePure -> Maybe StoredCRL
 lookupStore dp m
   | Just dpn <- distributionPointName dp 
   , names <- getURIs dpn = asum $ fmap (`Map.lookup` m) names
-  | otherwise = error "DP has no name"
+  | otherwise = throw $ CRLExtError "DP has no name"
 
 getURIs :: DistributionPointName -> [String]
 getURIs (DistributionPointFullName names) 
   | not $ null uris = uris
-  | otherwise       = error "DP has no URI to fetch CRL"
+  | otherwise       = throw $ CRLExtError "DP has no URI to fetch CRL"
   where uris = mapMaybe getURI names
-getURIs _ = error "Not implemented"
+getURIs _ = throw $ CRLExtError "Distribution point relative name is not implemented"
 
 getURI :: AltName -> Maybe String
 getURI (AltNameURI s) = Just $ normalizeCase s
